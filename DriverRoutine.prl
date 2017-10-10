@@ -1,0 +1,158 @@
+#!/usr/bin/perl
+# Driver routine for fragmentation of a molecule
+use strict;
+use List::Util qw(min max);
+use Chemistry::Mol;
+use Chemistry::File::Gaussian;
+use Chemistry::Bond::Find ':all';
+use Fragment; 
+use Fragmentation qw(:All);
+my $a2kcalmol=627.5095; 
+
+# Gaussian 09 input deck for all fragments 
+my $head="%mem=4GB\n%nprocshared=4\n#P B3LYP 6-31+G(d,p) NoSymm SCF(XQC,Fermi) Opt(maxcycle=100) Geom=NoCrowd";
+
+my $filename=$ARGV[0];
+$filename=~s/\.log//;
+my $method = $ARGV[1];
+my $Mtar   = $ARGV[2];
+if(!($method eq 'Write' or $method eq 'Read')){die "Bad calculation method $method \n";}
+if($method eq 'Write' and $Mtar <1){die "Bad target mass $Mtar \n";}
+print "Fragmenting parent ion $filename to target mass $Mtar \n";
+
+# Set up Gaussian file directory 
+my $dir="$filename\_$Mtar";$dir=~s/.com//;
+if($method eq 'Write'){
+	if(!(-e $dir)){`mkdir $dir`;`cp run.pbs $dir`;}
+}
+
+# Initialize parent Molecule and Fragment 
+my $pmol=Chemistry::Mol->read("$filename.log",format=>"log");
+my $E0=$pmol->name();
+$pmol->name("$E0,$filename.log");
+print "Your parent file has name ".$pmol->name()."\n";
+my ($E0,$file)=split(/,/,$pmol->name());
+
+my $M0 = $pmol->mass;
+my $q0 = $pmol->charge; 
+if(abs($q0)<1){die "Parent ion is uncharged!\n";}
+
+find_bonds($pmol);
+my $pstring=moleculeName($pmol);
+print "Parent ion: $pstring\n";
+print "Parent ion mass $M0 \n";
+print "Parent ion has ".scalar($pmol->bonds())." chemical bonds \n"; 
+
+
+my $parent = new Fragment(heavyAtoms($pmol)); 
+$parent->addIsomer($pmol); 
+
+my @temp=$parent->getIsomer(0)->separate; 
+if(scalar(@temp)>1){die "Your parent has multiple fragments!\n";}
+
+my @fragments=($parent);  my $fragments_ref=\@fragments;
+my @umols=($pmol);        my $umols_ref=\@umols;
+my @unames=($pstring);    my $unames_ref=\@unames;
+
+# Break all bonds in parent Molecule and build fragmentations that 
+# return Fragments matching the target 
+findTargetFragmentations($parent,$q0,$Mtar,$fragments_ref,$umols_ref,$unames_ref);
+
+# Isomerize all Fragments and save any new Molecules   
+Isomerize($fragments_ref,$umols_ref,$unames_ref);
+
+print "\nSummary of unique Molecules \nIndex Charge Mass Name \n";
+foreach my $im(0..scalar(@$unames_ref)-1){
+	my $s=${$unames_ref}[$im];
+	my $q=${$umols_ref}[$im]->charge();
+	my $m=${$umols_ref}[$im]->mass();
+	print sprintf("%3d %3d %7.2f %s \n",$im,$q,$m,$s);
+}
+
+
+
+# Write or read all unique molecules produced by fragmentation 
+foreach my $i(0..scalar(@umols)-1){
+	my $ist=sprintf("%03d",$i);
+	my $name2=${$unames_ref}[$i];
+	my $mass = $umols[$i]->mass();
+	if($method eq 'Write'){
+		$umols[$i]->write("./$dir/$ist.com",format=>"com",head=>$head,title=>"  $mass  $name2");
+	}
+	if($method eq 'Read'){
+		my $E=100000.;
+		if(-e "./$dir/$ist.log"){
+			$E=`tac ./$dir/$ist.log|grep -m1 "SCF Done" |awk "{print \\\$5}"`;
+			chomp($E);
+			my $c=`grep -c "Normal term" ./$dir/$ist.log`;
+			chomp($c);
+			if($c<1){$E=100000.;}
+		}
+		my $Ename=sprintf("%12.6f,%s.log",$E,$ist);
+		$umols[$i]->name($Ename);
+		print sprintf("Energy %12.6f %s.log %s \n",$E,$ist,${$unames_ref}[$i]);
+	}
+}
+
+
+
+if($method eq 'Read'){
+
+	# Evaluate fragmentation energies for each fragment chage $q0 
+	my @masses=(); 
+	my @Es=(); 
+	my @Etots=(); 
+	my @heavies=(); 
+	my @stoichiometries=(); 
+	my @files=(); 
+	my @Mtots=();
+	print "\nTotal energies of charged fragments\n";
+	foreach my $f(@$fragments_ref){
+		if($f->getIsomer(0)->charge() eq $q0){
+
+			my $m=sprintf("%9.3f",$f->getIsomer(0)->mass());
+			push(@masses,$m); 
+			#print "Checking molecule ".$f->getIsomer(0)->print("%f\n");
+
+			my $mult = mult($f->getIsomer(0));
+			# Get the stoichiometry of this fragment 
+			# and of the most stable sibling fragments 
+			# and the sum of masses as a 'sanity test'
+			my $M = $f->getIsomer(0)->mass();
+			my $file = $f->getFile(); 
+			my $s=moleculeName($f->getIsomer(0));
+			foreach my $f2(@{$f->{siblings}}){
+				# print "Its sibling is ".$f2->getIsomer(0)->print("%f\n");
+				$s=$s."+".moleculeName($f2->getIsomer(0));
+				$M = $M + $f2->getIsomer(0)->mass();
+			}
+			my $filenames=$f->getAllFiles();
+			push(@files,$filenames);
+			push(@stoichiometries,"$mult\_$s");
+			push(@heavies,$f->{heavy});
+			push(@Mtots,$M);
+
+			print sprintf("%20s ",$f->getIsomer(0)->sprintf("(%q)%f ")); 
+			my $Etot = $f->getEtot(); 
+			my $E    = $f->getE(); 
+			print sprintf("%18.6f %18.6f \n",$E,$Etot);
+			push(@Es,$E);
+			push(@Etots,$Etot);
+		}
+	}
+
+ 	# Find the minimum energy 
+ 	my $Emin=10000.; 
+ 	foreach my $E(@Etots){
+ 		if($E<$Emin){$Emin=$E;}
+	}
+
+	# Write the summary file 
+	open(F,">$filename\_$Mtar.res");
+	print F "# Mass DE Efragment Etotal Filename \n";
+	foreach my $i(0..scalar(@masses)-1){
+		print F sprintf("%10s %7.1f %12.6f %12.6f %s \n",$masses[$i],($Etots[$i]-$Emin)*$a2kcalmol,$Es[$i],$Etots[$i],$files[$i]);
+	}
+	close(F);
+}
+
